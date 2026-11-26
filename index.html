@@ -45,7 +45,7 @@ button.x{padding:8px 11px;background:transparent;color:var(--muted)}
 .shop{display:flex;align-items:center;gap:12px;padding:12px 14px}
 .shop input{width:22px;height:22px;accent-color:var(--main);flex:none}
 .shop.done{opacity:.5}.shop.done span{text-decoration:line-through}
-.shop .q{margin-left:auto;color:var(--muted);white-space:nowrap}
+.shop .q{margin-left:auto;color:var(--muted);white-space:nowrap;text-align:right}
 .empty{text-align:center;color:var(--muted);padding:32px 12px}
 nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);
   padding-bottom:env(safe-area-inset-bottom,0px)}
@@ -64,7 +64,7 @@ var db = load();
 var tab = "recipes";
 var draft = null;
 
-function blank() { return { recipes: [], days: 7, plan: [], checked: {} }; }
+function blank() { return { recipes: [], days: 7, plan: [], checked: {}, prices: {} }; }
 function load() {
   try { return Object.assign(blank(), JSON.parse(localStorage.getItem(KEY))); }
   catch (e) { return blank(); }
@@ -79,7 +79,7 @@ function uid() { return Date.now().toString(36) + Math.random().toString(36).sli
 function recipe(id) { return db.recipes.find(function (r) { return r.id === id; }); }
 
 /* ---------- Navigation ---------- */
-function go(t) { tab = t; draft = null; render(); window.scrollTo(0, 0); }
+function go(t) { tab = t; draft = null; pricing = false; pdraft = {}; render(); window.scrollTo(0, 0); }
 function render() {
   var tabs = [["recipes", "📖", "Recettes"], ["plan", "🗓️", "Planning"], ["shop", "🛒", "Courses"]];
   document.getElementById("nav").innerHTML = tabs.map(function (t) {
@@ -95,11 +95,20 @@ function viewRecipes() {
   var h = "<h1>Recettes</h1>";
   if (!list.length) h += '<div class="empty">Aucune recette pour l’instant.<br>Crée la première pour commencer.</div>';
   h += list.map(function (r) {
-    var n = r.ingredients.length;
+    var n = r.ingredients.length, c = sumCost(r.ingredients.map(base));
+    var pr = !n ? "" : c.miss === n ? "prix inconnus" : "≈ " + eur(c.t) + (c.miss ? " (" + c.miss + " sans prix)" : "");
     return '<div class="card row"><div class="grow"><h2>' + esc(r.name) + '</h2><div class="muted">' + n + " ingrédient" + (n > 1 ? "s" : "") +
+      (pr ? ", " + pr : "") +
       '</div></div><button onclick="editRecipe(\'' + r.id + '\')">Modifier</button></div>';
   }).join("");
-  return h + '<button class="main big" onclick="editRecipe()">Nouvelle recette</button>';
+  h += '<button class="main big" onclick="editRecipe()">Nouvelle recette</button>';
+  var st = db.lastBackup
+    ? "Dernière sauvegarde : " + new Date(db.lastBackup).toLocaleDateString("fr-FR")
+    : "Aucune sauvegarde pour l’instant. Exporte le fichier et enregistre-le dans Fichiers (iCloud Drive).";
+  return h + '<div class="card" style="margin-top:22px"><h2>Sauvegarde</h2><div class="muted" style="margin:4px 0 12px">' + st + '</div>' +
+    '<div class="row"><button class="grow" onclick="exportData()">Exporter</button>' +
+    '<button class="grow" onclick="document.getElementById(\'imp\').click()">Importer</button></div>' +
+    '<input type="file" id="imp" accept=".json,application/json" hidden onchange="importData(this)"></div>';
 }
 function editRecipe(id) {
   var r = id ? recipe(id) : null;
@@ -111,13 +120,14 @@ function viewForm() {
   h += '<div class="card"><input placeholder="Nom de la recette" value="' + esc(draft.name) + '" oninput="draft.name=this.value"></div>';
   h += '<div class="card"><h2 style="margin-bottom:10px">Ingrédients</h2>';
   h += draft.ingredients.map(function (g, i) {
-    return '<div class="ing"><input placeholder="Ingrédient" value="' + esc(g.name) + '" oninput="draft.ingredients[' + i + '].name=this.value">' +
+    return '<div class="ing"><input list="ings" autocapitalize="none" placeholder="Ingrédient" value="' + esc(g.name) + '" oninput="draft.ingredients[' + i + '].name=this.value">' +
       '<input type="number" inputmode="decimal" min="0" step="any" placeholder="Qté" value="' + esc(g.qty) + '" oninput="draft.ingredients[' + i + '].qty=this.value">' +
       '<select onchange="draft.ingredients[' + i + '].unit=this.value">' +
       UNITS.map(function (u) { return '<option value="' + esc(u) + '"' + (u === g.unit ? " selected" : "") + ">" + (u || "—") + "</option>"; }).join("") +
       '</select><button class="x" aria-label="Retirer" onclick="delIng(' + i + ')">✕</button></div>';
   }).join("");
-  h += '<button onclick="addIng()">Ajouter un ingrédient</button></div>';
+  h += '<button onclick="addIng()">Ajouter un ingrédient</button>' +
+    '<datalist id="ings">' + knownNames().map(function (n) { return '<option value="' + esc(n) + '">'; }).join("") + "</datalist></div>";
   h += '<button class="main big" onclick="saveRecipe()">Enregistrer</button>';
   h += '<button class="big" onclick="go(\'recipes\')">Annuler</button>';
   if (draft.id) h += '<button class="big danger" onclick="delRecipe()">Supprimer la recette</button>';
@@ -129,6 +139,20 @@ function saveRecipe() {
   if (!draft.name.trim()) { alert("Donne un nom à la recette."); return; }
   draft.name = draft.name.trim();
   draft.ingredients = draft.ingredients.filter(function (g) { return g.name.trim(); });
+  var known = knownNames(draft.id);
+  draft.ingredients.forEach(function (g) {
+    g.name = g.name.trim();
+    var n = norm(g.name);
+    if (known.some(function (k) { return norm(k) === n; })) {
+      g.name = known.filter(function (k) { return norm(k) === n; })[0];
+      return;
+    }
+    var close = known.filter(function (k) {
+      var m = norm(k);
+      return Math.min(n.length, m.length) >= 4 && lev(n, m) <= (Math.max(n.length, m.length) >= 7 ? 2 : 1);
+    })[0];
+    if (close && confirm("« " + g.name + " » ressemble à « " + close + " » déjà utilisé.\nUtiliser « " + close + " » ?")) g.name = close;
+  });
   if (draft.id) { db.recipes[db.recipes.findIndex(function (r) { return r.id === draft.id; })] = draft; }
   else { draft.id = uid(); db.recipes.push(draft); }
   save(); go("recipes");
@@ -176,12 +200,9 @@ function shopping() {
     (db.plan[d] || []).forEach(function (id) {
       var r = recipe(id); if (!r) return;
       r.ingredients.forEach(function (g) {
-        var q = parseFloat(g.qty) || 0, u = g.unit;
-        if (u === "kg") { q *= 1000; u = "g"; }
-        if (u === "L") { q *= 1000; u = "ml"; }
-        var key = g.name.trim().toLowerCase() + "|" + u;
-        if (!m[key]) m[key] = { key: key, name: g.name.trim(), q: 0, u: u };
-        m[key].q += q;
+        var b = base(g);
+        if (!m[b.key]) m[b.key] = { key: b.key, name: b.name, q: 0, u: b.u };
+        m[b.key].q += b.q;
       });
     });
   }
@@ -195,24 +216,149 @@ function fmt(it) {
   if (u === "ml" && q >= 1000) { q /= 1000; u = "L"; }
   return (Math.round(q * 100) / 100).toString().replace(".", ",") + (u ? " " + u : "");
 }
+var pricing = false, pdraft = {};
 function viewShop() {
   var items = shopping();
   var h = "<h1>Courses</h1>";
   if (!items.length) return h + '<div class="empty">La liste est vide.<br>Ajoute des plats dans le planning.</div>';
+  if (pricing) return h + viewPrices(items);
   var todo = items.filter(function (i) { return !db.checked[i.key]; });
   var done = items.filter(function (i) { return db.checked[i.key]; });
-  h += '<p class="muted">' + todo.length + " à acheter sur " + items.length + "</p>";
+  var s = sumCost(items), known = items.length - s.miss;
+  h += '<div class="card"><h2>' + (known ? "Total estimé : " + eur(s.t) : "Aucun prix enregistré") + "</h2>" +
+    '<div class="muted">' + todo.length + " à acheter sur " + items.length +
+    (known && s.miss ? ", " + s.miss + " sans prix" : "") + "</div></div>";
   h += todo.concat(done).map(function (i) {
-    var c = !!db.checked[i.key];
+    var c = !!db.checked[i.key], k = cost(i);
     return '<label class="card shop' + (c ? " done" : "") + '"><input type="checkbox"' + (c ? " checked" : "") +
       ' onchange="toggle(this.getAttribute(\'data-k\'))" data-k="' + esc(i.key) + '"><span>' + esc(i.name) +
-      '</span><span class="q">' + fmt(i) + "</span></label>";
+      '</span><span class="q">' + fmt(i) + (k != null ? "<br>" + eur(k) : "") + "</span></label>";
   }).join("");
+  h += '<button class="main big" onclick="pricing=true;render()">Saisir les prix</button>';
   if (done.length) h += '<button class="big" onclick="uncheckAll()">Tout décocher</button>';
   return h;
 }
+function viewPrices(items) {
+  var h = '<p class="muted">Indique le prix payé pour chaque produit acheté. Laisse vide les autres.</p>';
+  h += items.map(function (i) {
+    var a = avg(i.key);
+    return '<div class="card"><div class="row"><div class="grow"><h2>' + esc(i.name) + '</h2><div class="muted">€ par ' + refLabel(i.u) +
+      (a != null ? ", moyenne " + eur(a) : "") + '</div></div>' +
+      '<input type="number" inputmode="decimal" min="0" step="any" placeholder="0,00" style="width:96px" data-k="' + esc(i.key) +
+      '" value="' + esc(pdraft[i.key] || "") + '" oninput="pdraft[this.getAttribute(\'data-k\')]=this.value"></div>' +
+      (a != null ? '<button class="x" style="padding:6px 0;margin-top:6px" data-k="' + esc(i.key) +
+        '" onclick="resetPrice(this.getAttribute(\'data-k\'))">Effacer l’historique de ce produit</button>' : "") + "</div>";
+  }).join("");
+  return h + '<button class="main big" onclick="savePrices()">Enregistrer les prix</button>' +
+    '<button class="big" onclick="pricing=false;pdraft={};render()">Annuler</button>';
+}
+function savePrices() {
+  Object.keys(pdraft).forEach(function (k) {
+    var p = parseFloat(String(pdraft[k]).replace(",", "."));
+    if (!(p > 0)) return;
+    var a = db.prices[k] || [];
+    a.push({ p: p, d: Date.now() });
+    db.prices[k] = a.slice(-50);
+  });
+  pricing = false; pdraft = {}; save(); render();
+}
+function resetPrice(k) {
+  if (!confirm("Effacer l’historique de prix de ce produit ?")) return;
+  delete db.prices[k]; save(); render();
+}
 function toggle(k) { if (db.checked[k]) delete db.checked[k]; else db.checked[k] = true; save(); render(); }
 function uncheckAll() { db.checked = {}; save(); render(); }
+
+/* ---------- Prix ---------- */
+function base(g) {
+  var q = parseFloat(g.qty) || 0, u = g.unit;
+  if (u === "kg") { q *= 1000; u = "g"; }
+  if (u === "L") { q *= 1000; u = "ml"; }
+  if (u === "pièce(s)") u = "";
+  return { key: norm(g.name) + "|" + u, name: g.name.trim(), q: q, u: u };
+}
+function avg(key) {
+  var a = db.prices[key];
+  if (!a || !a.length) return null;
+  return a.reduce(function (s, x) { return s + x.p; }, 0) / a.length;
+}
+function cost(it) {
+  var a = avg(it.key);
+  if (a == null || !it.q) return null;
+  return (it.u === "g" || it.u === "ml" ? it.q / 1000 : it.q) * a;
+}
+function sumCost(items) {
+  var t = 0, miss = 0;
+  items.forEach(function (i) { var c = cost(i); if (c == null) miss++; else t += c; });
+  return { t: t, miss: miss };
+}
+function eur(x) { return x.toFixed(2).replace(".", ",") + " €"; }
+function refLabel(u) { return u === "g" ? "kg" : u === "ml" ? "L" : u === "" ? "unité" : u; }
+
+/* ---------- Noms d'ingrédients ---------- */
+function norm(s) {
+  s = String(s).trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+  return s.length > 3 ? s.replace(/[sx]$/, "") : s;
+}
+function knownNames(exceptId) {
+  var seen = {}, out = [];
+  db.recipes.forEach(function (r) {
+    if (r.id === exceptId) return;
+    r.ingredients.forEach(function (g) {
+      var k = norm(g.name);
+      if (g.name.trim() && !seen[k]) { seen[k] = 1; out.push(g.name.trim()); }
+    });
+  });
+  return out.sort(function (a, b) { return a.localeCompare(b, "fr"); });
+}
+function lev(a, b) {
+  var p = [], i, j;
+  for (j = 0; j <= b.length; j++) p[j] = j;
+  for (i = 1; i <= a.length; i++) {
+    var prev = p[0]; p[0] = i;
+    for (j = 1; j <= b.length; j++) {
+      var t = p[j];
+      p[j] = Math.min(p[j] + 1, p[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = t;
+    }
+  }
+  return p[b.length];
+}
+
+/* ---------- Sauvegarde ---------- */
+async function exportData() {
+  var file = new File([JSON.stringify(db, null, 1)], "recettes-" + new Date().toISOString().slice(0, 10) + ".json", { type: "application/json" });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file] });
+      db.lastBackup = Date.now(); save(); render(); return;
+    }
+  } catch (e) { if (e && e.name === "AbortError") return; }
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(file); a.download = file.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  db.lastBackup = Date.now(); save(); render();
+}
+function importData(inp) {
+  var f = inp.files[0]; if (!f) return;
+  var r = new FileReader();
+  r.onload = function () {
+    try {
+      var d = JSON.parse(r.result);
+      if (!Array.isArray(d.recipes)) throw new Error("format");
+      if (!confirm("Remplacer les données actuelles par cette sauvegarde (" + d.recipes.length + " recettes) ?")) return;
+      db = Object.assign(blank(), d); save(); render();
+      alert("Sauvegarde restaurée.");
+    } catch (e) { alert("Fichier non reconnu."); }
+  };
+  r.readAsText(f);
+}
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("sw.js").catch(function () {});
+  });
+}
 
 render();
 </script>
